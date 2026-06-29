@@ -1,72 +1,108 @@
 # Portal Hub
 
-One web page to control and manage every **Meta Portal** in your house. Run it on a machine on the
-same Wi‑Fi as your Portals, open the page in a browser (from that machine, or your laptop/phone),
-and manage them all from one place — over Wi‑Fi, no cable per action.
+Control all your **Meta Portal** devices from one web page — over Wi‑Fi, with no cable needed each
+time. Install apps, see what's installed, take screenshots, reboot, run commands, and keep apps up
+to date across every Portal in your home.
 
-- **See every Portal** + live status. Add them three ways: **Scan LAN** (auto-find Portals already
-  on Wi‑Fi adb), **＋ USB** one-time bootstrap, or type a name + IP.
-- **Apps:** see what's installed (with versions), **install** any APK (to one or several Portals at
-  once), and **uninstall / launch / force-stop / clear data**.
-- **Controls:** **screenshot**, **reboot**, key events (**Home / Back / Wake / Sleep**), and a
-  **shell** box for any `adb shell` command.
-- **Info:** model, Android version, battery, foreground app.
-- **Updates:** check any app across the fleet against a newer APK and update the Portals that are
-  behind. Drop in an APK for a one-off comparison, or attach a per-app **update source** (GitHub
-  repo / direct APK URL / local path) and "Check all" to see who's outdated. Newer-ness is decided
-  by `versionCode` (the integer the OS itself orders by); APK versions are read with a stdlib-only
-  parser. Nothing is app-specific — any package can have a source. Before an update, the Hub
-  compares signing-certificate SHA-256 fingerprints (via the SDK's `apksigner`, if present) and
-  **warns when the candidate is signed with a different key** than what's installed — the cause of
-  `INSTALL_FAILED_UPDATE_INCOMPATIBLE` — excluding those Portals from the bulk update.
+![Portal Hub welcome screen](docs/img/welcome.png)
 
-## Why the one-time USB step
+## What it can do
 
-Portals run Android 9/10, which predates Android 11's "wireless debugging with pairing code." There
-is no on-device toggle to start network adb, so each Portal needs a **one-time USB bootstrap** to
-flip adb into Wi‑Fi (TCP/IP) mode. After that, everything is wireless. **＋ USB** does that for you.
+- See every Portal and whether it's **online**.
+- **Install** an app (APK) to one Portal — or all of them at once.
+- See installed apps (with their icons) and **uninstall / open / force‑stop / clear** them.
+- Take a **screenshot**, **reboot**, press **Home / Back / Wake / Sleep**, or run a **command**.
+- **Check for newer versions** of an app and update the Portals that are behind.
 
-## Requirements
+## What you need
 
-- **Python 3.7+** — standard library only. No `pip`, no `npm`, no other tools.
-- **`adb`** (Android platform-tools) on your `PATH`. Set `ADB=/path/to/adb` to override.
+- A computer (Mac, Windows, or Linux) on the **same Wi‑Fi** as your Portals.
+- **Python 3.7+** — already on most Macs and Linux. (Windows: get it from [python.org](https://www.python.org/downloads/).)
+- **adb** — Android's "platform‑tools". One small download, and the *only* requirement:
+  - **macOS:** `brew install android-platform-tools`
+  - **Windows:** `winget install Google.PlatformTools`
+  - **Linux:** `sudo apt install adb` (or your distro's package)
 
-That's the complete dependency list.
+No accounts, no app store, nothing else — no `pip`, no `npm`.
 
-## Run
+## Start it
 
-```bash
-python3 server.py
-# -> open http://<this-machine-ip>:8080  (shown in the console)
-```
+1. **Get the project:** click **Code → Download ZIP** above and unzip it (or `git clone` it).
+2. **Run it** — open a terminal in the folder and type:
+   ```bash
+   python3 server.py
+   ```
+3. It prints a web address like `http://192.168.1.16:8080`. **Open that in a browser** — on this
+   computer, or on your phone/laptop on the same Wi‑Fi. You'll see the welcome screen above.
 
-Environment overrides: `PORT` (default 8080), `HOST` (default `0.0.0.0`, so other machines on the LAN
-can reach it), `ADB` (path to adb), and `DEBUG_APK` (optional path to an APK you rebuild often — set
-it to get a one-click "use latest debug build" checkbox in the install panel).
+## Add your first Portal (one time per Portal)
 
-## First-time setup per Portal
+Portals are older Android devices, so the very first connection needs a USB cable once. After that
+it's all wireless.
 
-1. Plug the Portal into this machine via USB and enable *Settings → Debug → ADB Enabled*.
-2. Click **＋ USB** — the Hub reads the Portal's Wi‑Fi IP, flips adb into TCP/IP mode, connects, and
-   saves it. Unplug the cable. Repeat for each Portal, or just click **Scan LAN** afterward to pick
-   up any Portal already in Wi‑Fi adb mode.
+1. On the Portal, open **Settings → Debug → ADB** and turn it on.
+2. Plug the Portal into your computer with a **USB‑C cable**.
+3. In Portal Hub, click **USB setup** (left side). It finds the Portal, switches it to Wi‑Fi adb, and
+   saves it. A box may pop up *on the Portal* asking to allow your computer — tap **Allow**.
+4. **Unplug the cable.** The Portal now shows as **Online** and is ready to use over Wi‑Fi.
 
-Tip: give each Portal a **DHCP reservation** on your router so its IP never changes.
+Repeat for each Portal. Set one up before? Click **Scan network** to find it automatically, or
+**Add by IP** if you know its address.
 
-## Caveats
+> 💡 **Tip:** in your router settings, give each Portal a fixed ("reserved") IP so it never changes.
 
-- **A reboot resets Wi‑Fi adb.** TCP/IP mode drops when a Portal reboots (Android 9/10 can't persist
-  it without root). Re-run **＋ USB** once after a reboot.
-- **Trusted networks only.** This server is unauthenticated and runs adb on your behalf — including a
-  shell and reboot. Anyone who can reach it controls your Portals. Run it only on your home LAN; don't
-  expose it to the internet or untrusted networks.
-- **Same subnet, no client isolation.** This machine and the Portals must be on the same subnet, and
-  the router's AP/client isolation (common on guest Wi‑Fi) must be off.
+## Using it
 
-## How it works
+Click a Portal on the left to manage it.
 
-`server.py` is a single-file `http.server` that serves the embedded HTML/JS UI and exposes a small
-JSON API; every action shells out to `adb` (`connect`, `devices`, `install -r`, `uninstall`,
-`shell pm/am/monkey/input`, `exec-out screencap`, `reboot`, `tcpip`). The LAN scan TCP-probes
-`:5555` across your /24 in parallel, then `adb connect`s the responders. Your saved Portal list lives
-in `devices.json` next to the script (git-ignored); uploaded APKs go to a temp dir.
+### Apps
+
+Install an APK (to this Portal or all online Portals at once), and manage what's already installed —
+open, force‑stop, clear data, or uninstall.
+
+![Apps tab](docs/img/apps.png)
+
+### Controls
+
+Take a **screenshot**, **reboot** the Portal, press **Home / Back / Wake / Sleep**, or run any
+`adb shell` command from the built‑in box.
+
+### Updates
+
+Check whether your apps have a newer version, and update the Portals that are behind. Point an app
+at a **GitHub repo** or an **APK link**, click **Check all sources**, and update with one click. It
+also **warns you** if an update is signed with a different key than what's installed (something
+Android would otherwise reject).
+
+![Updates view](docs/img/updates.png)
+
+## Good to know
+
+- **After a Portal reboots,** its wireless connection turns off (an Android 9/10 limitation). Just do
+  **USB setup** once more to bring it back.
+- **Keep it on your home network.** Portal Hub has no password and can control your devices — don't
+  expose it to the internet or to untrusted Wi‑Fi.
+- Your saved Portals and update sources are stored locally (`devices.json`, `sources.json`) and are
+  never shared.
+
+## Options (optional)
+
+Set these when starting, e.g. `PORT=9000 python3 server.py`:
+
+- `PORT` — web port (default `8080`)
+- `ADB` — full path to `adb` if it isn't on your `PATH`
+- `HOST` — address to bind (default `0.0.0.0`, so other devices on your Wi‑Fi can reach it)
+- `DEBUG_APK` — path to an APK you rebuild often, to get a one‑click "use latest build" option
+
+## Having trouble?
+
+- **Portal won't show up?** Make sure ADB is on, the cable is connected for **USB setup**, and you
+  tapped **Allow** on the Portal when prompted.
+- **"adb not found"?** Install platform‑tools (see *What you need*), or start with
+  `ADB=/full/path/to/adb python3 server.py`.
+- **Can't open the page from another device?** Both must be on the **same Wi‑Fi**, and the network
+  must let devices talk to each other (turn off "client isolation" / "AP isolation" on guest Wi‑Fi).
+
+---
+
+*Developers: see [`CLAUDE.md`](CLAUDE.md) for the architecture and the zero‑dependency design.*
