@@ -15,14 +15,18 @@ SECURITY: this server is UNAUTHENTICATED and runs adb (including a shell + reboo
 behalf. Run it only on a trusted home LAN.
 """
 
+import hashlib
 import json
 import os
 import re
 import socket
+import struct
 import subprocess
 import tempfile
 import threading
+import urllib.request
 import uuid
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -39,6 +43,10 @@ DEVICES_FILE = os.path.join(BASE, "devices.json")
 DEBUG_APK = os.environ.get("DEBUG_APK", "")
 UPLOAD_DIR = os.path.join(tempfile.gettempdir(), "portal-hub-uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+# Per-package update sources (any app -> where to fetch its candidate APK from).
+SOURCES_FILE = os.path.join(BASE, "sources.json")
+DL_DIR = os.path.join(tempfile.gettempdir(), "portal-hub-downloads")
+os.makedirs(DL_DIR, exist_ok=True)
 
 # Known Portal codenames (ro.product.device) for tagging LAN-scan finds.
 PORTAL_CODENAMES = {"terry", "aloha", "ripcurrent", "kong", "rosie"}
@@ -287,6 +295,208 @@ def app_action(ip, pkg, action):
     return {"ok": ok, "msg": blob or ("done" if ok else "exit %d" % rc)}
 
 
+# ------------------------------------------------------------- app updates
+# "Is an update available?" is decided by comparing versionCode (the integer the OS
+# itself orders by, and what `install -r` enforces) of a candidate APK against what's
+# installed on each Portal. Nothing is app-specific: any package can have a source.
+
+def _axml_strings(data, off):
+    str_count, _style, flags, str_start, _ss = struct.unpack_from("<IIIII", data, off + 8)
+    utf8 = (flags & (1 << 8)) != 0
+    offs, base, out = off + 28, off + str_start, []
+    for i in range(str_count):
+        p = base + struct.unpack_from("<I", data, offs + i * 4)[0]
+        if utf8:
+            cl = data[p]; p += 1
+            if cl & 0x80:
+                p += 1
+            bl = data[p]; p += 1
+            if bl & 0x80:
+                bl = ((bl & 0x7f) << 8) | data[p]; p += 1
+            out.append(data[p:p + bl].decode("utf-8", "replace"))
+        else:
+            cl = struct.unpack_from("<H", data, p)[0]; p += 2
+            if cl & 0x8000:
+                cl = ((cl & 0x7fff) << 16) | struct.unpack_from("<H", data, p)[0]; p += 2
+            out.append(data[p:p + cl * 2].decode("utf-16-le", "replace"))
+    return out
+
+
+def apk_version(path):
+    """Read {package, versionCode:int, versionName} from an APK's binary AndroidManifest.xml
+    using only the stdlib (zipfile + a minimal AXML parser). Returns None on failure."""
+    try:
+        with zipfile.ZipFile(path) as z:
+            data = z.read("AndroidManifest.xml")
+        off, strings, res = 8, None, {}
+        while off + 8 <= len(data):
+            ctyp, _h, csize = struct.unpack_from("<HHI", data, off)
+            if csize <= 0:
+                break
+            if ctyp == 0x0001:  # string pool
+                strings = _axml_strings(data, off)
+            elif ctyp == 0x0102 and strings is not None:  # START_TAG
+                name_idx = struct.unpack_from("<i", data, off + 20)[0]
+                attr_start = struct.unpack_from("<H", data, off + 24)[0]
+                attr_count = struct.unpack_from("<H", data, off + 28)[0]
+                if 0 <= name_idx < len(strings) and strings[name_idx] == "manifest":
+                    ab = off + 16 + attr_start
+                    for i in range(attr_count):
+                        a = ab + i * 20
+                        an = struct.unpack_from("<i", data, a + 4)[0]
+                        araw = struct.unpack_from("<i", data, a + 8)[0]
+                        adata = struct.unpack_from("<I", data, a + 16)[0]
+                        nm = strings[an] if 0 <= an < len(strings) else ""
+                        if nm == "versionCode":
+                            res["versionCode"] = adata
+                        elif nm == "versionName":
+                            res["versionName"] = strings[araw] if 0 <= araw < len(strings) else str(adata)
+                        elif nm == "package":
+                            res["package"] = strings[araw] if 0 <= araw < len(strings) else ""
+                    break
+            off += csize
+        if "package" in res and "versionCode" in res:
+            res.setdefault("versionName", "")
+            return res
+    except Exception:
+        pass
+    return None
+
+
+def load_sources():
+    try:
+        with open(SOURCES_FILE) as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def save_sources(s):
+    with _lock:
+        tmp = SOURCES_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(s, f, indent=2)
+        os.replace(tmp, SOURCES_FILE)
+
+
+def _http_get(url, token=None, timeout=30):
+    req = urllib.request.Request(url, headers={"User-Agent": "portal-hub"})
+    if token:
+        req.add_header("Authorization", "Bearer " + token)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def _download(url, token=None):
+    dest = os.path.join(DL_DIR, hashlib.sha1(url.encode()).hexdigest()[:16] + ".apk")
+    if not os.path.isfile(dest):
+        with open(dest, "wb") as f:
+            f.write(_http_get(url, token, timeout=180))
+    return dest
+
+
+def github_latest_apk(repo, token=None):
+    """'owner/name' -> download URL of the first .apk asset on the latest release."""
+    rel = json.loads(_http_get("https://api.github.com/repos/%s/releases/latest" % repo.strip("/"), token))
+    for a in rel.get("assets", []):
+        if a.get("name", "").lower().endswith(".apk"):
+            return a["browser_download_url"]
+    raise ValueError("latest release has no .apk asset")
+
+
+def resolve_candidate(src):
+    """An update source -> (apk_path, error). Downloads URL/GitHub sources (cached)."""
+    try:
+        t = src.get("type")
+        if t == "path":
+            p = src.get("value", "")
+            return (p, None) if os.path.isfile(p) else (None, "file not found")
+        if t == "url":
+            return _download(src["value"], src.get("token")), None
+        if t == "github":
+            return _download(github_latest_apk(src["value"], src.get("token")), src.get("token")), None
+        return None, "unknown source type"
+    except Exception as e:
+        return None, str(e)
+
+
+def installed_versions(ip, pkgs):
+    """{pkg: (versionCode:int|None, versionName:str)} in one round trip; None = not installed."""
+    safe = [re.sub(r"[^A-Za-z0-9_.]", "", p) for p in pkgs if p]
+    if not safe:
+        return {}
+    cmd = ("for p in %s; do d=$(dumpsys package \"$p\" 2>/dev/null); "
+           "c=$(echo \"$d\" | grep -m1 versionCode | sed 's/.*versionCode=//;s/ .*//'); "
+           "n=$(echo \"$d\" | grep -m1 versionName | sed 's/.*versionName=//'); "
+           "echo \"$p|$c|$n\"; done") % " ".join(safe)
+    _, out, _ = adb("-s", serial(ip), "shell", cmd, timeout=45)
+    res = {}
+    for line in out.splitlines():
+        parts = line.split("|")
+        if len(parts) >= 3:
+            c = parts[1].strip()
+            res[parts[0]] = (int(c) if c.isdigit() else None, parts[2].strip())
+    return res
+
+
+def update_status(installed_code, candidate_code):
+    if installed_code is None:
+        return "new"          # not installed -> fresh install
+    if installed_code < candidate_code:
+        return "update"       # behind -> update available
+    if installed_code == candidate_code:
+        return "current"      # up to date
+    return "newer"            # device has a newer build (install -r would refuse)
+
+
+def diff_apk(apk_path):
+    """Compare one APK's versionCode against every saved Portal."""
+    info = apk_version(apk_path)
+    if not info:
+        return {"ok": False, "msg": "could not read the APK's version"}
+    pkg, cand, states, devs = info["package"], info["versionCode"], adb_states(), []
+    for d in load_devices():
+        if states.get(serial(d["ip"])) != "device":
+            devs.append({"ip": d["ip"], "name": d["name"], "status": "offline"})
+            continue
+        iv = installed_versions(d["ip"], [pkg]).get(pkg, (None, ""))
+        devs.append({"ip": d["ip"], "name": d["name"], "installedCode": iv[0],
+                     "installedName": iv[1], "status": update_status(iv[0], cand)})
+    return {"ok": True, "package": pkg, "versionCode": cand,
+            "versionName": info.get("versionName", ""), "path": apk_path, "devices": devs}
+
+
+def check_sources():
+    """For each configured package, fetch its candidate and report fleet status."""
+    states = adb_states()
+    online = [d for d in load_devices() if states.get(serial(d["ip"])) == "device"]
+    rows = []
+    for pkg, src in load_sources().items():
+        apk, err = resolve_candidate(src)
+        info = apk_version(apk) if apk and not err else None
+        if not info:
+            rows.append({"package": pkg, "source": src, "error": err or "could not read candidate APK"})
+            continue
+        cand = info["versionCode"]
+        devs = [{"ip": d["ip"], "name": d["name"], **(lambda iv: {
+            "installedCode": iv[0], "installedName": iv[1], "status": update_status(iv[0], cand)})(
+            installed_versions(d["ip"], [pkg]).get(pkg, (None, "")))} for d in online]
+        rows.append({"package": pkg, "source": src, "path": apk, "candidateCode": cand,
+                     "candidateName": info.get("versionName", ""), "devices": devs})
+    return rows
+
+
+def apply_source(pkg, targets):
+    src = load_sources().get(pkg)
+    if not src:
+        return {"ok": False, "msg": "no source for " + pkg}
+    apk, err = resolve_candidate(src)
+    if err or not apk:
+        return {"ok": False, "msg": err or "no candidate APK"}
+    return {"ok": True, "results": install(apk, targets)}
+
+
 # ---------------------------------------------------------------- HTTP server
 
 class Handler(BaseHTTPRequestHandler):
@@ -323,6 +533,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, device_info(ip))
         elif u.path == "/api/apps":
             self._send(200, {"apps": list_apps(ip, q.get("system", ["0"])[0] == "1")})
+        elif u.path == "/api/sources":
+            self._send(200, {"sources": load_sources()})
         elif u.path == "/api/screenshot":
             rc, png, err = adb_bytes("-s", serial(ip), "exec-out", "screencap", "-p", timeout=30)
             if rc == 0 and png[:8] == b"\x89PNG\r\n\x1a\n":
@@ -379,6 +591,39 @@ class Handler(BaseHTTPRequestHandler):
             if not targets:
                 return self._send(400, {"ok": False, "msg": "no targets selected"})
             self._send(200, {"ok": True, "results": install(apk, targets)})
+        elif path == "/api/diff":
+            b = self._json()
+            apk = b.get("path") or (DEBUG_APK if b.get("useDebug") else None)
+            if not apk:
+                return self._send(400, {"ok": False, "msg": "no APK provided"})
+            self._send(200, diff_apk(apk))
+        elif path == "/api/source":
+            b = self._json()
+            pkg = (b.get("pkg") or "").strip()
+            typ = b.get("type") or ""
+            val = (b.get("value") or "").strip()
+            if not (re.match(r"^[A-Za-z0-9_.]+$", pkg) and typ in ("github", "url", "path") and val):
+                return self._send(400, {"ok": False, "msg": "package, type and value are required"})
+            s = load_sources()
+            s[pkg] = {"type": typ, "value": val}
+            if b.get("token"):
+                s[pkg]["token"] = b["token"].strip()
+            save_sources(s)
+            self._send(200, {"ok": True})
+        elif path == "/api/source-remove":
+            pkg = (self._json().get("pkg") or "").strip()
+            s = load_sources()
+            s.pop(pkg, None)
+            save_sources(s)
+            self._send(200, {"ok": True})
+        elif path == "/api/updates-check":
+            self._send(200, {"rows": check_sources()})
+        elif path == "/api/updates-apply":
+            b = self._json()
+            targets = [t for t in (b.get("targets") or []) if t]
+            if not (b.get("pkg") and targets):
+                return self._send(400, {"ok": False, "msg": "pkg and targets required"})
+            self._send(200, apply_source(b["pkg"].strip(), targets))
         elif path == "/api/app":
             b = self._json()
             self._send(200, app_action((b.get("ip") or "").strip(), (b.get("pkg") or "").strip(),
@@ -585,6 +830,7 @@ PAGE = r"""<!doctype html>
   <div class="brand"><div class="logo">🛰️</div><div><b>Portal Hub</b><div class="tag">manage your Meta Portals over Wi-Fi</div></div></div>
   <div class="spacer"></div>
   <div class="stat-pill" id="statPill"><span class="dot" style="width:7px;height:7px;border-radius:50%;background:var(--green)"></span><span id="statTxt">—</span></div>
+  <button class="btn ghost sm" onclick="showUpdates()" id="updBtn"></button>
   <button class="btn ghost sm" onclick="openHelp()" id="helpBtn"></button>
 </div>
 
@@ -658,6 +904,7 @@ const I={
   alert:'<path d="M12 9v4M12 17v.5"/><path d="M10.3 3.8L2.6 17a2 2 0 0 0 1.7 3h15.4a2 2 0 0 0 1.7-3L13.7 3.8a2 2 0 0 0-3.4 0z"/>',
   help:'<circle cx="12" cy="12" r="9"/><path d="M9.5 9.5a2.5 2.5 0 1 1 3.5 2.3c-.9.4-1 .9-1 1.7M12 17v.4"/>',
   dl:'<path d="M12 3v12M7 10l5 5 5-5M5 21h14"/>',
+  updates:'<path d="M21 8l-9-5-9 5 9 5 9-5zM3 8v8l9 5 9-5V8M12 13v8"/>',
 };
 const svg=(n,w)=>'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"'+(w?' style="width:'+w+'px;height:'+w+'px"':'')+'>'+I[n]+'</svg>';
 
@@ -677,13 +924,14 @@ function confirmDialog(title,body,danger){return new Promise(res=>{
   $('#modalRoot').appendChild(o);});}
 
 /* ---------- state ---------- */
-let devices=[],sel=null,tab='apps',debugApk=null,showSys=false,appQuery='',apps=[],installTarget='this',openMenu=null;
+let devices=[],sel=null,tab='apps',debugApk=null,showSys=false,appQuery='',apps=[],installTarget='this',openMenu=null,view='device',diffState=null;
 const stateMap={device:['Online','b-online'],offline:['Offline','b-off'],unauthorized:['Unauthorized','b-warn'],disconnected:['Not connected','b-off']};
 const badge=s=>{const m=stateMap[s]||['Unknown','b-off'];return '<span class="badge '+m[1]+'"><span class="dot"></span>'+m[0]+'</span>';};
 const onlineCount=()=>devices.filter(d=>d.state==='device').length;
 
 /* ---------- top buttons (icon labels) ---------- */
 $('#helpBtn').innerHTML=svg('help')+'Help';
+$('#updBtn').innerHTML=svg('updates')+'Updates';
 $('#refreshBtn').innerHTML=svg('refresh');
 $('#scanBtn').innerHTML=svg('scan')+'Scan network';
 $('#usbBtn').innerHTML=svg('usb')+'USB setup';
@@ -711,7 +959,7 @@ function renderDevs(){
       <button class="iconbtn kebab" title="Actions" onclick="event.stopPropagation();menu('${x.ip}',event)">${svg('dots')}</button>
     </div>`;}).join('');
 }
-window.pick=ip=>{sel=ip;tab='apps';if(decodeURIComponent(location.hash.slice(1))!==ip)location.hash=encodeURIComponent(ip);renderDevs();renderPanel();};
+window.pick=ip=>{sel=ip;tab='apps';view='device';if(decodeURIComponent(location.hash.slice(1))!==ip)location.hash=encodeURIComponent(ip);renderDevs();renderPanel();};
 function menu(ip,e){
   closeMenu();const card=document.querySelector('.dev[data-ip="'+ip+'"]');if(!card)return;
   const m=document.createElement('div');m.className='menu';openMenu=m;
@@ -748,7 +996,9 @@ function busy(sel,on){const b=$(sel);if(b)b.disabled=on;}
 
 /* ---------- detail panel ---------- */
 function renderPanel(){
-  const p=$('#panel');const d=devices.find(x=>x.ip===sel);
+  const p=$('#panel');
+  if(view==='updates'){renderUpdates();return;}
+  const d=devices.find(x=>x.ip===sel);
   if(!d){p.innerHTML=emptyState();return;}
   p.innerHTML=`
     <div class="dh">
@@ -944,7 +1194,114 @@ async function poll(){
   const hb=$('#hdBadge');if(hb&&sel){const sd=devices.find(z=>z.ip===sel);if(sd)hb.outerHTML='<span id="hdBadge">'+badge(sd.state)+'</span>';}
 }
 
-loadDevices().then(()=>{const h=decodeURIComponent(location.hash.slice(1));if(h&&devices.find(d=>d.ip===h))pick(h);});
+/* ---------- UPDATES (fleet view) ---------- */
+function showUpdates(){view='updates';sel=null;location.hash='updates';renderDevs();renderPanel();}
+function uBadge(s){const m={update:['Update available','b-warn'],current:['Up to date','b-online'],new:['Not installed','b-off'],newer:['Newer on device','b-warn'],offline:['Offline','b-off']}[s]||['—','b-off'];return '<span class="badge '+m[1]+'"><span class="dot"></span>'+m[0]+'</span>';}
+function renderUpdates(){
+  $('#panel').innerHTML=`
+    <div class="dh">
+      <div class="av">${svg('updates',22)}</div>
+      <div style="min-width:0"><h2>Updates</h2><div class="meta">Compare installed apps against a newer APK and update your Portals — versionCode decides what's newer.</div></div>
+      <div class="dh-actions"><button class="btn ghost sm" onclick="view='device';location.hash='';renderDevs();renderPanel()">${svg('back')}Done</button></div>
+    </div>
+    <div class="tabbody">
+      <div class="sub-card">
+        <h3>Check an APK against your Portals</h3>
+        <div class="desc">Drop in any APK — the Hub reads its version and shows which Portals are behind, missing it, or already up to date.</div>
+        <div class="drop" id="udrop">${svg('up')}<div><b>Drop an APK here</b> or click to browse</div></div>
+        <input type="file" id="uapk" accept=".apk" style="display:none">
+        <div id="ufile"></div><div id="diffRes"></div>
+      </div>
+      <div class="sub-card">
+        <h3>Update sources <span class="hint" style="font-weight:400">— optional, per app</span></h3>
+        <div class="desc">Attach a source to any package — a GitHub repo, a direct APK URL, or a file on this machine. “Check all” fetches the latest version from each and flags Portals that are behind. Nothing is app-specific.</div>
+        <div class="ctl-row" style="margin-bottom:12px">
+          <button class="btn" id="checkBtn" onclick="checkSources()">${svg('refresh')}Check all sources</button>
+          <button class="btn ghost" onclick="toggleSrcForm()">${svg('plus')}Add source</button>
+        </div>
+        <div id="srcForm" style="display:none"></div>
+        <div id="srcList"></div><div id="checkRes"></div>
+      </div>
+    </div>`;
+  const dz=$('#udrop'),fi=$('#uapk');dz.onclick=()=>fi.click();fi.onchange=()=>doDiff(fi.files[0]);
+  ['dragover','dragenter'].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.add('drag');}));
+  ['dragleave','drop'].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.remove('drag');}));
+  dz.addEventListener('drop',e=>{const f=e.dataTransfer.files[0];if(f)doDiff(f);});
+  loadSources();
+}
+async function doDiff(file){if(!file)return;
+  $('#ufile').innerHTML='<div class="filechip">'+svg('check',14)+esc(file.name)+'</div>';
+  $('#diffRes').innerHTML='<div class="res-line">Uploading &amp; comparing…</div>';
+  const up=await fetch('/api/upload',{method:'POST',headers:{'X-Filename':file.name},body:file}).then(r=>r.json());
+  if(!up.ok)return $('#diffRes').innerHTML='<div class="res-line err">Upload failed</div>';
+  const r=await api('/api/diff',{path:up.path});
+  if(!r.ok)return $('#diffRes').innerHTML='<div class="res-line err">'+esc(r.msg||'Could not read APK')+'</div>';
+  diffState=r;renderDiff(r);
+}
+function renderDiff(r){
+  const behind=r.devices.filter(d=>d.status==='update'||d.status==='new');
+  $('#diffRes').innerHTML=`<div style="margin:12px 0 8px"><b class="pk">${esc(r.package)}</b> · candidate <b>v${esc(r.versionName)}</b> <span class="hint">(code ${r.versionCode})</span></div>`+
+    '<div class="applist">'+r.devices.map(d=>`<div class="approw"><div style="min-width:0">
+      <div class="nm">${esc(d.name)}</div><div class="vr">${d.installedName?('installed v'+esc(d.installedName)+' · code '+d.installedCode):(d.status==='offline'?'offline':'not installed')}</div></div>
+      <div class="acts">${uBadge(d.status)}</div></div>`).join('')+'</div>'+
+    (behind.length?'<button class="btn" style="margin-top:12px" onclick="applyDiff()">'+svg('up')+'Install to '+behind.length+' Portal(s) behind</button>'
+      :'<div class="res-line ok" style="margin-top:10px">Every online Portal is already up to date.</div>');
+}
+async function applyDiff(){if(!diffState)return;
+  const t=diffState.devices.filter(d=>d.status==='update'||d.status==='new').map(d=>d.ip);
+  toast('Installing to '+t.length+' Portal(s)…','info');
+  const r=await api('/api/install',{path:diffState.path,targets:t});
+  const ok=(r.results||[]).filter(x=>x.ok).length;toast(ok+'/'+(r.results||[]).length+' installed',ok?'ok':'err');
+  (r.results||[]).filter(x=>!x.ok).forEach(x=>toast(x.ip+': '+x.msg,'err'));
+  const rr=await api('/api/diff',{path:diffState.path});if(rr.ok){diffState=rr;renderDiff(rr);}
+}
+async function loadSources(){const r=await api('/api/sources');const s=r.sources||{};const keys=Object.keys(s);const el=$('#srcList');if(!el)return;
+  if(!keys.length){el.innerHTML='<p class="hint">No sources yet — add one to enable automatic update checks.</p>';return;}
+  el.innerHTML='<div class="applist">'+keys.map(p=>`<div class="approw"><div style="min-width:0">
+    <div class="pk">${esc(p)}</div><div class="vr">${esc(s[p].type)} · ${esc(s[p].value)}</div></div>
+    <div class="acts"><button class="btn danger sm" title="Remove source" onclick="removeSource('${p}')">${svg('trash')}</button></div></div>`).join('')+'</div>';
+}
+function toggleSrcForm(){const f=$('#srcForm');if(f.style.display==='none'){f.innerHTML=srcFormHtml();f.style.display='block';bindSrc();}else f.style.display='none';}
+function srcFormHtml(){return `<div class="sub-card" style="background:var(--bg)">
+  <div class="ctl-row"><div style="flex:1;min-width:150px"><label class="field-lbl">Package name</label><input class="input" id="sPkg" placeholder="com.example.app"></div>
+  <div style="width:150px"><label class="field-lbl">Source type</label><select class="input" id="sType"><option value="github">GitHub repo</option><option value="url">APK URL</option><option value="path">Local path</option></select></div></div>
+  <div style="margin-top:10px"><label class="field-lbl" id="sValLbl">owner / repo</label><input class="input" id="sVal" placeholder="owner/repo"></div>
+  <div style="margin-top:10px" id="sTokWrap"><label class="field-lbl">GitHub token <span class="hint">(optional — private repos / higher rate limit)</span></label><input class="input" id="sTok" placeholder="ghp_…"></div>
+  <button class="btn block" style="margin-top:12px" onclick="addSource()">Save source</button>
+  <p class="hint" style="margin:8px 0 0">The package name must match the app's id exactly (see it on the Apps tab).</p></div>`;}
+function bindSrc(){const t=$('#sType');t.onchange=()=>{const v=t.value;
+  $('#sValLbl').textContent=v==='github'?'owner / repo':v==='url'?'APK URL (https)':'Local file path on this machine';
+  $('#sVal').placeholder=v==='github'?'owner/repo':v==='url'?'https://…/app.apk':'/path/to/app.apk';
+  $('#sTokWrap').style.display=v==='github'?'block':'none';};}
+async function addSource(){const pkg=$('#sPkg').value.trim(),type=$('#sType').value,value=$('#sVal').value.trim(),token=($('#sTok')||{}).value;
+  if(!pkg||!value)return toast('Package and value are required','err');
+  const r=await api('/api/source',{pkg,type,value,token:(token||'').trim()});
+  if(!r.ok)return toast(r.msg||'Failed','err');
+  toast('Source saved','ok');$('#srcForm').style.display='none';loadSources();
+}
+window.removeSource=async p=>{if(!await confirmDialog('Remove source?','Stop tracking updates for <code>'+esc(p)+'</code>? (The app itself is not touched.)',true))return;
+  await api('/api/source-remove',{pkg:p});toast('Source removed','ok');loadSources();};
+async function checkSources(){const btn=$('#checkBtn');if(btn)btn.disabled=true;
+  $('#checkRes').innerHTML='<div class="res-line">Fetching latest versions &amp; comparing across your Portals… this can take a few seconds.</div>';
+  const r=await api('/api/updates-check',{});if(btn)btn.disabled=false;const rows=r.rows||[];
+  if(!rows.length){$('#checkRes').innerHTML='<p class="hint" style="margin-top:10px">Add a source above, then check.</p>';return;}
+  $('#checkRes').innerHTML=rows.map(row=>{
+    if(row.error)return '<div class="sub-card" style="background:var(--bg)"><b class="pk">'+esc(row.package)+'</b><div class="res-line err" style="margin-top:8px">'+esc(row.error)+'</div></div>';
+    const behind=row.devices.filter(d=>d.status==='update'||d.status==='new');
+    return `<div class="sub-card" style="background:var(--bg)">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><b class="pk">${esc(row.package)}</b>
+        <span class="badge b-warn" style="background:var(--accent-soft);color:#c7d2fe;border-color:rgba(99,102,241,.4)"><span class="dot" style="background:var(--accent)"></span>latest v${esc(row.candidateName)} · code ${row.candidateCode}</span>
+        <span class="hint">via ${esc(row.source.type)}</span></div>
+      <div class="applist" style="margin-top:10px">${row.devices.length?row.devices.map(d=>`<div class="approw"><div style="min-width:0"><div class="nm">${esc(d.name)}</div><div class="vr">${d.installedName?('installed v'+esc(d.installedName)):'not installed'}</div></div><div class="acts">${uBadge(d.status)}</div></div>`).join(''):'<div class="approw"><span class="hint">No online Portals.</span></div>'}</div>
+      ${behind.length?'<button class="btn" style="margin-top:12px" onclick="applySource(\''+row.package+'\',['+behind.map(d=>'\''+d.ip+'\'').join(',')+'])">'+svg('up')+'Update '+behind.length+' Portal(s)</button>':'<div class="res-line ok" style="margin-top:10px">All online Portals up to date.</div>'}
+    </div>`;}).join('');
+}
+window.applySource=async(pkg,targets)=>{toast('Updating '+targets.length+' Portal(s)…','info');
+  const r=await api('/api/updates-apply',{pkg,targets});if(!r.ok)return toast(r.msg||'Update failed','err');
+  const ok=(r.results||[]).filter(x=>x.ok).length;toast(ok+'/'+(r.results||[]).length+' updated',ok?'ok':'err');
+  (r.results||[]).filter(x=>!x.ok).forEach(x=>toast(x.ip+': '+x.msg,'err'));checkSources();};
+
+loadDevices().then(()=>{const h=decodeURIComponent(location.hash.slice(1));if(h==='updates')showUpdates();else if(h&&devices.find(d=>d.ip===h))pick(h);});
 window.addEventListener('hashchange',()=>{const h=decodeURIComponent(location.hash.slice(1));if(h&&h!==sel&&devices.find(d=>d.ip===h))pick(h);});
 setInterval(poll,8000);
 </script>

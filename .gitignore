@@ -1,2 +1,3 @@
-# runtime state (your saved Portal list)
+# runtime state (your saved Portal list + per-app update sources)
 devices.json
+sources.json

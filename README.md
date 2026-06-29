@@ -11,6 +11,11 @@ and manage them all from one place — over Wi‑Fi, no cable per action.
 - **Controls:** **screenshot**, **reboot**, key events (**Home / Back / Wake / Sleep**), and a
   **shell** box for any `adb shell` command.
 - **Info:** model, Android version, battery, foreground app.
+- **Updates:** check any app across the fleet against a newer APK and update the Portals that are
+  behind. Drop in an APK for a one-off comparison, or attach a per-app **update source** (GitHub
+  repo / direct APK URL / local path) and "Check all" to see who's outdated. Newer-ness is decided
+  by `versionCode` (the integer the OS itself orders by); APK versions are read with a stdlib-only
+  parser. Nothing is app-specific — any package can have a source.
 
 ## Why the one-time USB step
 
