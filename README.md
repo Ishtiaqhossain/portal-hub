@@ -15,7 +15,10 @@ and manage them all from one place — over Wi‑Fi, no cable per action.
   behind. Drop in an APK for a one-off comparison, or attach a per-app **update source** (GitHub
   repo / direct APK URL / local path) and "Check all" to see who's outdated. Newer-ness is decided
   by `versionCode` (the integer the OS itself orders by); APK versions are read with a stdlib-only
-  parser. Nothing is app-specific — any package can have a source.
+  parser. Nothing is app-specific — any package can have a source. Before an update, the Hub
+  compares signing-certificate SHA-256 fingerprints (via the SDK's `apksigner`, if present) and
+  **warns when the candidate is signed with a different key** than what's installed — the cause of
+  `INSTALL_FAILED_UPDATE_INCOMPATIBLE` — excluding those Portals from the bulk update.
 
 ## Why the one-time USB step
 

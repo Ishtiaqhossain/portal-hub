@@ -15,10 +15,12 @@ SECURITY: this server is UNAUTHENTICATED and runs adb (including a shell + reboo
 behalf. Run it only on a trusted home LAN.
 """
 
+import glob
 import hashlib
 import json
 import os
 import re
+import shutil
 import socket
 import struct
 import subprocess
@@ -363,6 +365,80 @@ def apk_version(path):
     return None
 
 
+# Signer pre-check: `install -r` is rejected (INSTALL_FAILED_UPDATE_INCOMPATIBLE) if the candidate
+# is signed with a different key than what's installed. We compare SHA-256 cert digests via
+# `apksigner` (from the Android SDK). If apksigner isn't found, the check degrades to "unknown".
+_apksigner = None
+_signer_cache = {}
+_inst_signer_cache = {}
+
+
+def apksigner_path():
+    global _apksigner
+    if _apksigner is None:
+        cand = os.environ.get("APKSIGNER") or shutil.which("apksigner")
+        if not (cand and os.path.isfile(cand)):
+            roots = [os.environ.get("ANDROID_HOME"), os.environ.get("ANDROID_SDK_ROOT"),
+                     os.path.expanduser("~/Library/Android/sdk"), os.path.expanduser("~/Android/Sdk")]
+            hits = []
+            for r in roots:
+                if r:
+                    hits += glob.glob(os.path.join(r, "build-tools", "*", "apksigner"))
+            cand = sorted(hits)[-1] if hits else ""
+        _apksigner = cand or ""
+    return _apksigner or None
+
+
+def apk_signer(path):
+    """SHA-256 of the APK's signing certificate (first signer), or None if unknown."""
+    if not (path and os.path.isfile(path)):
+        return None
+    tool = apksigner_path()
+    if not tool:
+        return None
+    key = (os.path.abspath(path), os.path.getmtime(path))
+    if key in _signer_cache:
+        return _signer_cache[key]
+    sha = None
+    try:
+        p = subprocess.run([tool, "verify", "--print-certs", path], capture_output=True, text=True, timeout=60)
+        m = re.search(r"certificate SHA-256 digest:\s*([0-9a-fA-F]+)", p.stdout)
+        sha = m.group(1).lower() if m else None
+    except Exception:
+        sha = None
+    _signer_cache[key] = sha
+    return sha
+
+
+def installed_signer(ip, pkg, code):
+    """SHA-256 signer of the app installed on a device (pulls its base.apk once, cached)."""
+    if not apksigner_path():
+        return None
+    key = (ip, pkg, code)
+    if key in _inst_signer_cache:
+        return _inst_signer_cache[key]
+    _, out, _ = adb("-s", serial(ip), "shell", "pm", "path", pkg, timeout=20)
+    dev_apk = next((l.split("package:", 1)[1].strip() for l in out.splitlines() if l.startswith("package:")), "")
+    sha = None
+    if dev_apk:
+        local = os.path.join(DL_DIR, "installed-" + hashlib.sha1(("%s|%s|%s" % key).encode()).hexdigest()[:12] + ".apk")
+        rc, _o, _e = adb("-s", serial(ip), "pull", dev_apk, local, timeout=180)
+        if rc == 0:
+            sha = apk_signer(local)
+        try:
+            os.remove(local)
+        except OSError:
+            pass
+    _inst_signer_cache[key] = sha
+    return sha
+
+
+def signer_status(candidate_sha, installed_sha):
+    if candidate_sha and installed_sha:
+        return "ok" if candidate_sha == installed_sha else "mismatch"
+    return "unknown"
+
+
 def load_sources():
     try:
         with open(SOURCES_FILE) as f:
@@ -456,13 +532,17 @@ def diff_apk(apk_path):
     if not info:
         return {"ok": False, "msg": "could not read the APK's version"}
     pkg, cand, states, devs = info["package"], info["versionCode"], adb_states(), []
+    cand_sig = apk_signer(apk_path)
     for d in load_devices():
         if states.get(serial(d["ip"])) != "device":
             devs.append({"ip": d["ip"], "name": d["name"], "status": "offline"})
             continue
         iv = installed_versions(d["ip"], [pkg]).get(pkg, (None, ""))
-        devs.append({"ip": d["ip"], "name": d["name"], "installedCode": iv[0],
-                     "installedName": iv[1], "status": update_status(iv[0], cand)})
+        st = update_status(iv[0], cand)
+        e = {"ip": d["ip"], "name": d["name"], "installedCode": iv[0], "installedName": iv[1], "status": st}
+        if st == "update":  # only an update-over-existing can hit a signer mismatch
+            e["signer"] = signer_status(cand_sig, installed_signer(d["ip"], pkg, iv[0]))
+        devs.append(e)
     return {"ok": True, "package": pkg, "versionCode": cand,
             "versionName": info.get("versionName", ""), "path": apk_path, "devices": devs}
 
@@ -479,9 +559,15 @@ def check_sources():
             rows.append({"package": pkg, "source": src, "error": err or "could not read candidate APK"})
             continue
         cand = info["versionCode"]
-        devs = [{"ip": d["ip"], "name": d["name"], **(lambda iv: {
-            "installedCode": iv[0], "installedName": iv[1], "status": update_status(iv[0], cand)})(
-            installed_versions(d["ip"], [pkg]).get(pkg, (None, "")))} for d in online]
+        cand_sig = apk_signer(apk)
+        devs = []
+        for d in online:
+            iv = installed_versions(d["ip"], [pkg]).get(pkg, (None, ""))
+            st = update_status(iv[0], cand)
+            e = {"ip": d["ip"], "name": d["name"], "installedCode": iv[0], "installedName": iv[1], "status": st}
+            if st == "update":
+                e["signer"] = signer_status(cand_sig, installed_signer(d["ip"], pkg, iv[0]))
+            devs.append(e)
         rows.append({"package": pkg, "source": src, "path": apk, "candidateCode": cand,
                      "candidateName": info.get("versionName", ""), "devices": devs})
     return rows
@@ -1197,6 +1283,9 @@ async function poll(){
 /* ---------- UPDATES (fleet view) ---------- */
 function showUpdates(){view='updates';sel=null;location.hash='updates';renderDevs();renderPanel();}
 function uBadge(s){const m={update:['Update available','b-warn'],current:['Up to date','b-online'],new:['Not installed','b-off'],newer:['Newer on device','b-warn'],offline:['Offline','b-off']}[s]||['—','b-off'];return '<span class="badge '+m[1]+'"><span class="dot"></span>'+m[0]+'</span>';}
+function isBehind(d){return d.status==='new'||(d.status==='update'&&d.signer!=='mismatch');}
+function sigChip(d){return d.signer==='mismatch'?' <span class="badge b-warn" title="Different signing key — Android will reject the update"><span class="dot"></span>signing differs</span>':'';}
+function blockedNote(n){return n?'<div class="warnbox" style="margin-top:10px">'+svg('alert')+'<div><b>'+n+'</b> Portal(s) have this app signed with a different key, so the update would be rejected. Uninstall the app there first to switch signing keys.</div></div>':'';}
 function renderUpdates(){
   $('#panel').innerHTML=`
     <div class="dh">
@@ -1239,16 +1328,17 @@ async function doDiff(file){if(!file)return;
   diffState=r;renderDiff(r);
 }
 function renderDiff(r){
-  const behind=r.devices.filter(d=>d.status==='update'||d.status==='new');
+  const behind=r.devices.filter(isBehind);
+  const blocked=r.devices.filter(d=>d.status==='update'&&d.signer==='mismatch').length;
   $('#diffRes').innerHTML=`<div style="margin:12px 0 8px"><b class="pk">${esc(r.package)}</b> · candidate <b>v${esc(r.versionName)}</b> <span class="hint">(code ${r.versionCode})</span></div>`+
     '<div class="applist">'+r.devices.map(d=>`<div class="approw"><div style="min-width:0">
       <div class="nm">${esc(d.name)}</div><div class="vr">${d.installedName?('installed v'+esc(d.installedName)+' · code '+d.installedCode):(d.status==='offline'?'offline':'not installed')}</div></div>
-      <div class="acts">${uBadge(d.status)}</div></div>`).join('')+'</div>'+
-    (behind.length?'<button class="btn" style="margin-top:12px" onclick="applyDiff()">'+svg('up')+'Install to '+behind.length+' Portal(s) behind</button>'
-      :'<div class="res-line ok" style="margin-top:10px">Every online Portal is already up to date.</div>');
+      <div class="acts">${uBadge(d.status)}${sigChip(d)}</div></div>`).join('')+'</div>'+blockedNote(blocked)+
+    (behind.length?'<button class="btn" style="margin-top:12px" onclick="applyDiff()">'+svg('up')+'Install to '+behind.length+' Portal(s)</button>'
+      :(blocked?'':'<div class="res-line ok" style="margin-top:10px">Every online Portal is already up to date.</div>'));
 }
 async function applyDiff(){if(!diffState)return;
-  const t=diffState.devices.filter(d=>d.status==='update'||d.status==='new').map(d=>d.ip);
+  const t=diffState.devices.filter(isBehind).map(d=>d.ip);
   toast('Installing to '+t.length+' Portal(s)…','info');
   const r=await api('/api/install',{path:diffState.path,targets:t});
   const ok=(r.results||[]).filter(x=>x.ok).length;toast(ok+'/'+(r.results||[]).length+' installed',ok?'ok':'err');
@@ -1287,13 +1377,14 @@ async function checkSources(){const btn=$('#checkBtn');if(btn)btn.disabled=true;
   if(!rows.length){$('#checkRes').innerHTML='<p class="hint" style="margin-top:10px">Add a source above, then check.</p>';return;}
   $('#checkRes').innerHTML=rows.map(row=>{
     if(row.error)return '<div class="sub-card" style="background:var(--bg)"><b class="pk">'+esc(row.package)+'</b><div class="res-line err" style="margin-top:8px">'+esc(row.error)+'</div></div>';
-    const behind=row.devices.filter(d=>d.status==='update'||d.status==='new');
+    const behind=row.devices.filter(isBehind);
+    const blocked=row.devices.filter(d=>d.status==='update'&&d.signer==='mismatch').length;
     return `<div class="sub-card" style="background:var(--bg)">
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><b class="pk">${esc(row.package)}</b>
         <span class="badge b-warn" style="background:var(--accent-soft);color:#c7d2fe;border-color:rgba(99,102,241,.4)"><span class="dot" style="background:var(--accent)"></span>latest v${esc(row.candidateName)} · code ${row.candidateCode}</span>
         <span class="hint">via ${esc(row.source.type)}</span></div>
-      <div class="applist" style="margin-top:10px">${row.devices.length?row.devices.map(d=>`<div class="approw"><div style="min-width:0"><div class="nm">${esc(d.name)}</div><div class="vr">${d.installedName?('installed v'+esc(d.installedName)):'not installed'}</div></div><div class="acts">${uBadge(d.status)}</div></div>`).join(''):'<div class="approw"><span class="hint">No online Portals.</span></div>'}</div>
-      ${behind.length?'<button class="btn" style="margin-top:12px" onclick="applySource(\''+row.package+'\',['+behind.map(d=>'\''+d.ip+'\'').join(',')+'])">'+svg('up')+'Update '+behind.length+' Portal(s)</button>':'<div class="res-line ok" style="margin-top:10px">All online Portals up to date.</div>'}
+      <div class="applist" style="margin-top:10px">${row.devices.length?row.devices.map(d=>`<div class="approw"><div style="min-width:0"><div class="nm">${esc(d.name)}</div><div class="vr">${d.installedName?('installed v'+esc(d.installedName)):'not installed'}</div></div><div class="acts">${uBadge(d.status)}${sigChip(d)}</div></div>`).join(''):'<div class="approw"><span class="hint">No online Portals.</span></div>'}</div>${blockedNote(blocked)}
+      ${behind.length?'<button class="btn" style="margin-top:12px" onclick="applySource(\''+row.package+'\',['+behind.map(d=>'\''+d.ip+'\'').join(',')+'])">'+svg('up')+'Update '+behind.length+' Portal(s)</button>':(blocked?'':'<div class="res-line ok" style="margin-top:10px">All online Portals up to date.</div>')}
     </div>`;}).join('');
 }
 window.applySource=async(pkg,targets)=>{toast('Updating '+targets.length+' Portal(s)…','info');
