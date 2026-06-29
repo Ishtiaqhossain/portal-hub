@@ -20,7 +20,8 @@ The entire value proposition is **zero install friction**. Keep it that way:
   CSS/JS frameworks. The UI is hand-written HTML/CSS/JS with inline SVG icons.
 - **The only runtime requirement is `adb`** (Android platform-tools) on `PATH`.
 - **Optional, soft** integrations that must *degrade gracefully when absent*: the Android SDK's
-  `apksigner` (used for the signing-key check — falls back to "unknown" if not found).
+  `apksigner` (signing-key check — falls back to "unknown") and `aapt2`/`aapt` (resolving an app's
+  launcher icon, incl. R8-renamed resources — falls back to a filename heuristic, then no icon).
 
 Before adding anything, ask: can the stdlib do this? It almost always can (`http.server`,
 `urllib.request`, `zipfile`, `struct`, `socket`, `concurrent.futures`, `subprocess`). Do **not**
@@ -47,7 +48,8 @@ auto-discovered apksigner), plus `ANDROID_HOME` / `ANDROID_SDK_ROOT` (searched f
   - adb helpers: `adb`, `adb_bytes`, `serial`, `adb_states`, `usb_serials`, `valid_ip`.
   - device store (`devices.json`): `load_devices` / `save_devices` / `upsert_device`,
     `list_devices_with_state`, `connect`, `bootstrap_usb`, `scan_lan`.
-  - per-device: `device_info`, `list_apps`, `install`, `app_action`.
+  - per-device: `device_info`, `list_apps`, `install`, `app_action`, `app_icon` (pulls the app's
+    base.apk once, extracts the launcher icon, caches the bytes; size-guarded, served by `/api/icon`).
   - **app updates**: `apk_version` (a stdlib binary-AXML parser — reads `versionCode`/`versionName`/
     `package` straight from `AndroidManifest.xml`), `apk_signer` / `installed_signer` /
     `signer_status` (SHA-256 cert check via `apksigner`), update sources (`sources.json`:

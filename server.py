@@ -439,6 +439,105 @@ def signer_status(candidate_sha, installed_sha):
     return "unknown"
 
 
+# App icons: resolve the launcher icon's path with the SDK's `aapt`/`aapt2` (which works even for
+# R8-shrunk APKs where the file is renamed), then extract it from the APK zip. Degrades to no icon
+# if aapt isn't found and the icon isn't at a guessable path. Pulls the device's base.apk once,
+# caches the (tiny) extracted bytes by package.
+_aapt = None
+_icon_cache = {}
+_ICON_DENSITY = {"xxxhdpi": 6, "xxhdpi": 5, "xhdpi": 4, "hdpi": 3, "tvdpi": 2, "mdpi": 1}
+
+
+def aapt_path():
+    global _aapt
+    if _aapt is None:
+        cand = ""
+        for name in ("aapt2", "aapt"):
+            cand = shutil.which(name) or ""
+            if cand:
+                break
+        if not cand:
+            hits = []
+            for r in [os.environ.get("ANDROID_HOME"), os.environ.get("ANDROID_SDK_ROOT"),
+                      os.path.expanduser("~/Library/Android/sdk"), os.path.expanduser("~/Android/Sdk")]:
+                if r:
+                    hits += glob.glob(os.path.join(r, "build-tools", "*", "aapt2"))
+            cand = sorted(hits)[-1] if hits else ""
+        _aapt = cand or ""
+    return _aapt or None
+
+
+def _aapt_icon_entry(apk):
+    tool = aapt_path()
+    if not tool:
+        return None
+    try:
+        out = subprocess.run([tool, "dump", "badging", apk], capture_output=True, text=True, timeout=60).stdout
+        best = (-1, None)
+        for m in re.finditer(r"application-icon-(\d+):'([^']+)'", out):
+            path = m.group(2)
+            if path.lower().endswith((".png", ".webp")) and int(m.group(1)) > best[0]:
+                best = (int(m.group(1)), path)
+        if best[1]:
+            return best[1]
+        m = re.search(r"application:\s+label='[^']*'\s+icon='([^']+)'", out)
+        if m and m.group(1).lower().endswith((".png", ".webp")):
+            return m.group(1)
+    except Exception:
+        pass
+    return None
+
+
+def _heuristic_icon_entry(z):
+    best = (-1, None)
+    for n in z.namelist():
+        ln = n.lower()
+        if ln.endswith((".png", ".webp")) and "ic_launcher" in ln and "round" not in ln:
+            score = max((v for k, v in _ICON_DENSITY.items() if k in ln), default=0)
+            if score > best[0]:
+                best = (score, n)
+    return best[1]
+
+
+def extract_icon(apk):
+    try:
+        with zipfile.ZipFile(apk) as z:
+            entry = _aapt_icon_entry(apk) or _heuristic_icon_entry(z)
+            if not entry or entry not in z.namelist():
+                return None, None
+            ct = "image/webp" if entry.lower().endswith(".webp") else "image/png"
+            return z.read(entry), ct
+    except Exception:
+        return None, None
+
+
+def app_icon(ip, pkg):
+    """(bytes, content_type) of an installed app's launcher icon, or (None, None). Cached by package."""
+    if pkg in _icon_cache:
+        return _icon_cache[pkg]
+    out = (None, None)
+    _, o, _ = adb("-s", serial(ip), "shell", "pm", "path", pkg, timeout=20)
+    dev = next((l.split("package:", 1)[1].strip() for l in o.splitlines() if l.startswith("package:")), "")
+    if dev:
+        _, sz, _ = adb("-s", serial(ip), "shell", "stat", "-c", "%s", dev, timeout=15)
+        try:
+            if int(sz.strip()) > 200 * 1024 * 1024:  # don't pull a giant APK just for an icon
+                _icon_cache[pkg] = out
+                return out
+        except ValueError:
+            pass
+        local = os.path.join(DL_DIR, "icon-" + hashlib.sha1((ip + pkg).encode()).hexdigest()[:12] + ".apk")
+        rc, _a, _b = adb("-s", serial(ip), "pull", dev, local, timeout=180)
+        if rc == 0:
+            out = extract_icon(local)
+        try:
+            os.remove(local)
+        except OSError:
+            pass
+    _icon_cache[pkg] = out
+    return out
+
+
 def load_sources():
     try:
         with open(SOURCES_FILE) as f:
@@ -621,6 +720,20 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"apps": list_apps(ip, q.get("system", ["0"])[0] == "1")})
         elif u.path == "/api/sources":
             self._send(200, {"sources": load_sources()})
+        elif u.path == "/api/icon":
+            pkg = (q.get("pkg", [""])[0]).strip()
+            if not (valid_ip(ip) and re.match(r"^[A-Za-z0-9_.]+$", pkg)):
+                return self._send(404, {"error": "bad params"})
+            data, ct = app_icon(ip, pkg)
+            if data:
+                self.send_response(200)
+                self.send_header("Content-Type", ct)
+                self.send_header("Cache-Control", "max-age=86400")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            else:
+                self._send(404, {"error": "no icon"})
         elif u.path == "/api/screenshot":
             rc, png, err = adb_bytes("-s", serial(ip), "exec-out", "screencap", "-p", timeout=30)
             if rc == 0 and png[:8] == b"\x89PNG\r\n\x1a\n":
@@ -866,6 +979,8 @@ PAGE = r"""<!doctype html>
   .approw:last-child{border-bottom:0} .approw:hover{background:var(--surface-2)}
   .approw .pk{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;word-break:break-all}
   .approw .vr{font-size:11.5px;color:var(--faint)} .approw .acts{margin-left:auto;display:flex;gap:6px;flex:none}
+  .app-ico{position:relative;width:36px;height:36px;border-radius:9px;background:var(--surface-3);display:grid;place-items:center;flex:none;overflow:hidden;color:var(--faint)}
+  .app-ico img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
   .skel{height:44px;background:linear-gradient(90deg,var(--surface-2),var(--surface-3),var(--surface-2));
     background-size:200% 100%;animation:sh 1.2s infinite;border-radius:8px;margin-bottom:8px}
   @keyframes sh{to{background-position:-200% 0}}
@@ -1189,6 +1304,7 @@ function renderAppRows(){
   if(!list.length){el.innerHTML='<p class="hint">No apps match “'+esc(appQuery)+'”.</p>';return;}
   el.innerHTML='<div class="hint" style="margin-bottom:8px">'+list.length+' app'+(list.length>1?'s':'')+(showSys?' (incl. system)':'')+'</div><div class="applist">'+
     list.map(a=>`<div class="approw">
+      <span class="app-ico">${svg('apps',16)}<img loading="lazy" src="/api/icon?ip=${encodeURIComponent(sel)}&pkg=${encodeURIComponent(a.pkg)}" onerror="this.remove()"></span>
       <div style="min-width:0"><div class="pk">${esc(a.pkg)}</div>${a.version?'<div class="vr">v'+esc(a.version)+'</div>':''}</div>
       <div class="acts">
         <button class="btn subtle sm" title="Launch" onclick="appAct('${a.pkg}','launch')">${svg('play')}</button>
