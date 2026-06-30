@@ -1,3 +1,6 @@
 # runtime state (your saved Portal list + per-app update sources)
 devices.json
 sources.json
+
+# auto-downloaded Android platform-tools (adb), cached on first run
+.platform-tools/

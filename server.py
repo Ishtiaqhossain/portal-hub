@@ -6,8 +6,10 @@ Run it on a machine on the same Wi-Fi as your Portals, open the page in a browse
   - see installed apps per device; install (any APK), uninstall, launch, force-stop, clear data
   - common ADB controls: screenshot, reboot, key events (Home/Back/Wake/Sleep), a shell box
 
-Dependencies: Python 3.7+ standard library, and `adb` (Android platform-tools) on PATH.
-No metavr, no pip installs, no node_modules. Set ADB=/path/to/adb to override.
+Dependencies: Python 3.7+ standard library only. `adb` (Android platform-tools) is used
+under the hood; if it isn't on PATH the server downloads Google's official platform-tools
+on first run and caches it next to this script. No metavr, no pip installs, no node_modules.
+Set ADB=/path/to/adb to point at your own adb and skip the download.
 
   python3 server.py            # then open http://<this-machine-ip>:8080
 
@@ -24,6 +26,7 @@ import shutil
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import urllib.request
@@ -49,6 +52,15 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 SOURCES_FILE = os.path.join(BASE, "sources.json")
 DL_DIR = os.path.join(tempfile.gettempdir(), "portal-hub-downloads")
 os.makedirs(DL_DIR, exist_ok=True)
+
+# adb auto-fetch: if `adb` isn't on PATH, download Google's official platform-tools
+# (stdlib only, cached next to the script) so the lone prerequisite is Python itself.
+PT_CACHE = os.path.join(BASE, ".platform-tools")
+PT_URLS = {  # Google's canonical "latest" builds, by OS
+    "darwin": "https://dl.google.com/android/repository/platform-tools-latest-darwin.zip",
+    "linux": "https://dl.google.com/android/repository/platform-tools-latest-linux.zip",
+    "windows": "https://dl.google.com/android/repository/platform-tools-latest-windows.zip",
+}
 
 # Known Portal codenames (ro.product.device) for tagging LAN-scan finds.
 PORTAL_CODENAMES = {"terry", "aloha", "ripcurrent", "kong", "rosie"}
@@ -1516,8 +1528,72 @@ setInterval(poll,8000);
 """
 
 
+def _host_os():
+    if sys.platform.startswith("win"):
+        return "windows"
+    if sys.platform.startswith("linux"):
+        return "linux"
+    if sys.platform == "darwin":
+        return "darwin"
+    return None
+
+
+def _adb_ok(path):
+    """True if `path` actually runs as adb — so we never re-download a working one."""
+    try:
+        return subprocess.run([path, "version"], capture_output=True, timeout=10).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def ensure_adb():
+    """Point the global ADB at a working adb, fetching one if needed. Resolution order:
+    explicit ADB= override -> adb on PATH -> a copy we cached earlier -> download Google's
+    official platform-tools for this OS. On any failure we leave ADB as-is; the existing
+    'adb not found' error then guides the user to install it or set ADB=."""
+    global ADB
+    if os.environ.get("ADB"):          # explicit override — trust it, broken or not
+        return
+    found = shutil.which("adb")        # already installed system-wide
+    if found and _adb_ok(found):
+        ADB = found
+        return
+    exe = "adb.exe" if sys.platform.startswith("win") else "adb"
+    cached = os.path.join(PT_CACHE, "platform-tools", exe)
+    if os.path.isfile(cached) and _adb_ok(cached):   # downloaded on an earlier run
+        ADB = cached
+        return
+    url = PT_URLS.get(_host_os() or "")
+    if not url:
+        print("  adb:     not found and no platform-tools build for %r — install adb manually." % sys.platform)
+        return
+    try:
+        print("  adb:     not found — downloading Google platform-tools (~15 MB, one time)...")
+        os.makedirs(PT_CACHE, exist_ok=True)
+        zip_path = os.path.join(PT_CACHE, "platform-tools.zip")
+        req = urllib.request.Request(url, headers={"User-Agent": "portal-hub"})
+        with urllib.request.urlopen(req, timeout=300) as r, open(zip_path, "wb") as f:
+            shutil.copyfileobj(r, f)
+        with zipfile.ZipFile(zip_path) as z:
+            z.extractall(PT_CACHE)
+        os.remove(zip_path)
+        if not sys.platform.startswith("win"):   # zip drops the +x bit; restore it on the tools
+            tools = os.path.join(PT_CACHE, "platform-tools")
+            for name in os.listdir(tools):
+                fp = os.path.join(tools, name)
+                if os.path.isfile(fp):
+                    os.chmod(fp, 0o755)
+        if _adb_ok(cached):
+            ADB = cached
+        else:
+            print("  adb:     downloaded, but adb won't run here — install platform-tools manually.")
+    except Exception as e:
+        print("  adb:     auto-download failed (%s) — install platform-tools manually, or set ADB=." % e)
+
+
 def main():
     print("Portal Hub")
+    ensure_adb()
     print("  adb:     %s" % ADB)
     print("  serving: http://%s:%d  (open from any machine on the LAN)" % (HOST, PORT))
     print("  devices: %s" % DEVICES_FILE)

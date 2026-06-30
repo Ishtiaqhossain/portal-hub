@@ -18,12 +18,17 @@ to date across every Portal in your home.
 
 - A computer (Mac, Windows, or Linux) on the **same Wi‑Fi** as your Portals.
 - **Python 3.7+** — already on most Macs and Linux. (Windows: get it from [python.org](https://www.python.org/downloads/).)
-- **adb** — Android's "platform‑tools". One small download, and the *only* requirement:
-  - **macOS:** `brew install android-platform-tools`
-  - **Windows:** `winget install Google.PlatformTools`
-  - **Linux:** `sudo apt install adb` (or your distro's package)
+
+That's it. Portal Hub needs Android's **adb** ("platform‑tools") to talk to your Portals, but
+**you don't have to install it** — the first time you run the Hub, it downloads the official one
+from Google (~15 MB) and tucks it away in a `.platform-tools` folder next to `server.py`. If you
+already have adb, it's used automatically instead.
 
 No accounts, no app store, nothing else — no `pip`, no `npm`.
+
+> Prefer to install adb yourself? Any of these works and the Hub will pick it up:
+> **macOS** `brew install android-platform-tools` · **Windows** `winget install Google.PlatformTools`
+> · **Linux** `sudo apt install adb`. Or point the Hub at a specific one with `ADB=/path/to/adb`.
 
 ## Start it
 
